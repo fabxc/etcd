@@ -158,6 +158,7 @@ func New(cfg Config) (Client, error) {
 		return nil, err
 	}
 	if !cfg.NoAutosync {
+		c.ctx, c.cancel = context.WithCancel(context.Background())
 		go func() {
 			err := c.autosync(cfg.autosyncInterval())
 			if err != nil && err != context.Canceled {
@@ -165,7 +166,6 @@ func New(cfg Config) (Client, error) {
 			}
 		}()
 	}
-	c.ctx, c.cancel = context.WithCancel(context.Background())
 	return c, nil
 }
 
@@ -344,7 +344,6 @@ func (c *httpClusterClient) autosync(interval time.Duration) error {
 		case <-tick:
 		}
 	}
-	return nil
 }
 
 type roundTripResponse struct {
