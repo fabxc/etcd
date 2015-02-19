@@ -62,8 +62,9 @@ func mustNewMembersAPI(c *cli.Context) client.MembersAPI {
 	}
 
 	cfg := client.Config{
-		Transport: tr,
-		Endpoints: eps,
+		Transport:  tr,
+		Endpoints:  eps,
+		NoAutosync: true,
 	}
 
 	hc, err := client.New(cfg)

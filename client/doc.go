@@ -33,6 +33,7 @@ Create a Config and exchange it for a Client:
 	if err != nil {
 		// handle error
 	}
+	defer c.Close()
 
 Create a KeysAPI using the Client, then use it to interact with etcd:
 
