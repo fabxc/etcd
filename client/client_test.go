@@ -688,6 +688,58 @@ func TestHTTPClusterClientSyncFail(t *testing.T) {
 	}
 }
 
+func TestHTTPClusterClientAutosync(t *testing.T) {
+	tr := newFakeTransport()
+	tr.respchan = make(chan *http.Response) // synchronus
+	tr.finishCancel <- struct{}{}
+
+	cf := func(ep url.URL) httpClient {
+		return &simpleHTTPClient{transport: tr}
+	}
+	fakeResp := func() *http.Response {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       ioutil.NopCloser(strings.NewReader(`{"members":[{"id":"42134f434382925","peerURLs":["http://127.0.0.1:2380","http://127.0.0.1:7001"],"name":"node1","clientURLs":["http://127.0.0.1:2379","http://127.0.0.1:4001"]}]}`)),
+		}
+	}
+
+	hc := &httpClusterClient{clientFactory: cf}
+	hc.ctx, hc.cancel = context.WithCancel(context.Background())
+	hc.reset([]string{"127.0.0.1:4001"})
+
+	canceled := make(chan struct{})
+	go func() {
+		err := hc.autosync(1 * time.Millisecond)
+		if err == context.Canceled {
+			canceled <- struct{}{}
+			return
+		}
+		t.Fatalf("autosync exited unexpectedly: want=%#v, got=%#v", context.Canceled, err)
+	}()
+
+	// test multiple rounds
+	for i := 0; i < 5; i++ {
+		select {
+		case tr.respchan <- fakeResp():
+			// expected
+		case <-time.After(1 * time.Second):
+			t.Fatalf("autosync did not start sync within time")
+		}
+	}
+
+	// autosync has to stop on Closing the client
+	hc.Close()
+
+	select {
+	case <-canceled:
+		// expected autosync to terminate
+	case tr.respchan <- fakeResp():
+		t.Fatalf("received sync request after closing client")
+	case <-time.After(1 * time.Second):
+		t.Fatalf("autosync did not exit within time")
+	}
+}
+
 func TestHTTPClusterClientResetFail(t *testing.T) {
 	tests := [][]string{
 		// need at least one endpoint
@@ -703,5 +755,23 @@ func TestHTTPClusterClientResetFail(t *testing.T) {
 		if err == nil {
 			t.Errorf("#%d: expected non-nil error", i)
 		}
+	}
+}
+
+func TestHTTPClusterClientResetKeepPinned(t *testing.T) {
+	hc := &httpClusterClient{}
+	err := hc.reset([]string{"foo", "bar"})
+	if err != nil {
+		t.Errorf("unexpected error: %s", err)
+	}
+	hc.pinned = 0
+	pu := hc.endpoints[hc.pinned]
+
+	err = hc.reset([]string{"bar", "test", "foo"})
+	if err != nil {
+		t.Errorf("unexpected error: %s", err)
+	}
+	if pu != hc.endpoints[hc.pinned] {
+		t.Fatalf("reset did not preserve endpoint pinning")
 	}
 }

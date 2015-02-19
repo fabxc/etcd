@@ -18,6 +18,8 @@ import (
 	"errors"
 	"fmt"
 	"io/ioutil"
+	"log"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
@@ -33,7 +35,10 @@ var (
 	errTooManyRedirectChecks = errors.New("client: too many redirect checks")
 )
 
-var DefaultRequestTimeout = 5 * time.Second
+var (
+	DefaultRequestTimeout   = 5 * time.Second
+	DefaultAutosyncInterval = 10 * time.Minute
+)
 
 var DefaultTransport CancelableTransport = &http.Transport{
 	Proxy: http.ProxyFromEnvironment,
@@ -42,6 +47,10 @@ var DefaultTransport CancelableTransport = &http.Transport{
 		KeepAlive: 30 * time.Second,
 	}).Dial,
 	TLSHandshakeTimeout: 10 * time.Second,
+}
+
+func init() {
+	rand.Seed(int64(time.Now().Nanosecond()))
 }
 
 type Config struct {
@@ -76,6 +85,15 @@ type Config struct {
 	// If CheckRedirect is nil, the Client uses its default policy,
 	// which is to stop after 10 consecutive requests.
 	CheckRedirect CheckRedirectFunc
+
+	// NoAutosync defines whether the client attempts to synchronise
+	// with the cluster in regular intervals defined by AutosyncInterval.
+	NoAutosync bool
+
+	// AutosyncInterval specifies the time between automatic synchronisation.
+	//
+	// If zero the DefaultAutosyncInterval is used.
+	AutosyncInterval time.Duration
 }
 
 func (cfg *Config) transport() CancelableTransport {
@@ -90,6 +108,13 @@ func (cfg *Config) checkRedirect() CheckRedirectFunc {
 		return DefaultCheckRedirect
 	}
 	return cfg.CheckRedirect
+}
+
+func (cfg *Config) autosyncInterval() time.Duration {
+	if cfg.AutosyncInterval == 0 {
+		return DefaultAutosyncInterval
+	}
+	return cfg.AutosyncInterval
 }
 
 // CancelableTransport mimics net/http.Transport, but requires that
@@ -113,6 +138,9 @@ type Client interface {
 	// Sync updates the internal cache of the etcd cluster's membership.
 	Sync(context.Context) error
 
+	// Close terminates automatic background synchronisation if running.
+	Close()
+
 	// Endpoints returns a copy of the current set of API endpoints used
 	// by Client to resolve HTTP requests. If Sync has ever been called,
 	// this may differ from the initial Endpoints provided in the Config.
@@ -122,10 +150,22 @@ type Client interface {
 }
 
 func New(cfg Config) (Client, error) {
-	c := &httpClusterClient{clientFactory: newHTTPClientFactory(cfg.transport(), cfg.checkRedirect())}
+	c := &httpClusterClient{
+		clientFactory: newHTTPClientFactory(cfg.transport(), cfg.checkRedirect()),
+		pinned:        rand.Intn(len(cfg.Endpoints)),
+	}
 	if err := c.reset(cfg.Endpoints); err != nil {
 		return nil, err
 	}
+	if !cfg.NoAutosync {
+		go func() {
+			err := c.autosync(cfg.autosyncInterval())
+			if err != nil && err != context.Canceled {
+				log.Println("client: auto synchronisation failed:", err)
+			}
+		}()
+	}
+	c.ctx, c.cancel = context.WithCancel(context.Background())
 	return c, nil
 }
 
@@ -154,6 +194,12 @@ type httpAction interface {
 type httpClusterClient struct {
 	clientFactory httpClientFactory
 	endpoints     []url.URL
+	pinned        int
+
+	// Context used for automatic synchronisation and its cancel function
+	ctx    context.Context
+	cancel context.CancelFunc
+
 	sync.RWMutex
 }
 
@@ -171,46 +217,86 @@ func (c *httpClusterClient) reset(eps []string) error {
 		neps[i] = *u
 	}
 
+	// keep pinned endpoint if possible
+	if len(c.endpoints) > 0 {
+		prevPinned := c.endpoints[c.pinned]
+		for i, ep := range neps {
+			if ep == prevPinned {
+				c.pinned = i
+				break
+			}
+		}
+	}
 	c.endpoints = neps
 
 	return nil
 }
 
+func (c *httpClusterClient) Close() {
+	if c.cancel != nil {
+		c.cancel()
+	}
+}
+
 func (c *httpClusterClient) Do(ctx context.Context, act httpAction) (*http.Response, []byte, error) {
 	c.RLock()
+	pin := c.pinned
 	leps := len(c.endpoints)
 	eps := make([]url.URL, leps)
-	n := copy(eps, c.endpoints)
+	copy(eps, c.endpoints)
 	c.RUnlock()
 
 	if leps == 0 {
 		return nil, nil, ErrNoEndpoints
 	}
 
-	if leps != n {
-		return nil, nil, errors.New("unable to pick endpoint: copy failed")
+	hc := c.clientFactory(eps[pin])
+	resp, body, err := hc.Do(ctx, act)
+	if err == context.DeadlineExceeded || err == context.Canceled {
+		return nil, nil, err
+	}
+	if err == nil && resp.StatusCode/100 != 5 {
+		return resp, body, err
 	}
 
-	var resp *http.Response
-	var body []byte
-	var err error
+	failed := 1
 
-	for _, ep := range eps {
-		hc := c.clientFactory(ep)
-		resp, body, err = hc.Do(ctx, act)
-		if err != nil {
-			if err == context.DeadlineExceeded || err == context.Canceled {
-				return nil, nil, err
+	// synchronise after finishing the request with a new healthy endpoint
+	if c.ctx != nil {
+		defer func() {
+			// break infinite recursion if all endpoints are unhealthy
+			if failed == leps {
+				return
 			}
-			continue
-		}
-		if resp.StatusCode/100 == 5 {
-			continue
-		}
-		break
+			ctx, cancel := context.WithTimeout(c.ctx, DefaultRequestTimeout)
+			err := c.Sync(ctx)
+			if err != nil {
+				log.Println("client: error on synchronisation:", err)
+			}
+			cancel()
+		}()
 	}
 
-	return resp, body, err
+	// try available endpoints randomly and pin the first healthy one
+	for _, npin := range rand.Perm(leps) {
+		if npin == pin {
+			continue
+		}
+		hc = c.clientFactory(eps[npin])
+		resp, body, err = hc.Do(ctx, act)
+		if err == context.DeadlineExceeded || err == context.Canceled {
+			return nil, nil, err
+		}
+		if err == nil && resp.StatusCode/100 != 5 {
+			// if we had success with a new endpoint update pinned
+			c.Lock()
+			c.pinned = npin
+			c.Unlock()
+			return resp, body, err
+		}
+		failed++
+	}
+	return nil, nil, err
 }
 
 func (c *httpClusterClient) Endpoints() []string {
@@ -241,6 +327,24 @@ func (c *httpClusterClient) Sync(ctx context.Context) error {
 	}
 
 	return c.reset(eps)
+}
+
+func (c *httpClusterClient) autosync(interval time.Duration) error {
+	tick := time.NewTicker(interval).C
+	for {
+		ctx, cancel := context.WithTimeout(c.ctx, DefaultRequestTimeout)
+		err := c.Sync(ctx)
+		cancel()
+		if err != nil && err != context.Canceled {
+			log.Println("client: error on auto synchronisation:", err)
+		}
+		select {
+		case <-c.ctx.Done():
+			return c.ctx.Err()
+		case <-tick:
+		}
+	}
+	return nil
 }
 
 type roundTripResponse struct {
